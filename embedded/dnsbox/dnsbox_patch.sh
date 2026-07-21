@@ -1,0 +1,71 @@
+#!/bin/sh
+
+[ -e "/tmp/dnsbox_patch.log" ] && return 0
+
+cat << 'EOF' > /etc/init.d/dns-box
+#!/bin/sh /etc/rc.common
+# OpenWrt init script for dns-box (binary in /data)
+# start_service returns instantly: waiting for network happens inside the
+# procd-supervised `launch` command, so boot is never blocked (Xiaomi stock
+# firmware reboots the router via watchdog if an init script stalls the
+# boot sequence).
+
+START=99
+USE_PROCD=1
+EXTRA_COMMANDS="launch"
+
+SCRIPT=/etc/init.d/dns-box
+DATADIR=/data/dns-box
+PROG=${DATADIR}/dns-box
+CONF=${DATADIR}/config.json
+
+wait_for_network() {
+    n=0
+    while [ "$n" -lt 30 ]; do
+        ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+        n=$((n + 1))
+        sleep 2
+    done
+    echo "[dns-box] Network wait timed out, continuing anyway..."
+}
+
+# Несжатый бинарник кладёт приложение be3600 в /data (флеш) при установке:
+# из /data он маппится постранично и не занимает tmpfs (копия в /tmp плюс
+# распакованный UPX-образ жили бы в RAM целиком). Из сети ничего не
+# скачивается — единственный источник бинарника само приложение.
+check_binary() {
+    [ -x "$PROG" ] && return 0
+    echo "[dns-box] Binary not found at $PROG. Reinstall dns-box from the be3600 app."
+    return 1
+}
+
+# Выполняется под procd: проверяет бинарник, ждёт сеть и замещает себя dns-box'ом.
+launch() {
+    check_binary || { sleep 10; exit 1; }
+    wait_for_network
+    # Ограничиваем кучу Go-рантайма: без лимита он неохотно отдаёт память
+    # системе, а на роутере её ~176 МБ на всё.
+    export GOMEMLIMIT=64MiB GOGC=50
+    exec "$PROG" -config "$CONF"
+}
+
+start_service() {
+    procd_open_instance
+    procd_set_param command "$SCRIPT" launch
+    procd_set_param limits core="unlimited"
+    procd_set_param limits nofile="1000000 1000000"
+    procd_set_param respawn 3600 10 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() {
+    procd_add_reload_trigger "dns-box"
+}
+EOF
+
+chmod +x /etc/init.d/dns-box
+/etc/init.d/dns-box enable
+/etc/init.d/dns-box start
+echo "dnsbox enabled" > /tmp/dnsbox_patch.log

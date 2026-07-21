@@ -1,0 +1,111 @@
+{
+  "log": {
+    "level": "debug"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns_proxy",
+        "address": "1.1.1.1",
+        "address_resolver": "dns_direct",
+        "strategy": "prefer_ipv4",
+        "detour": "mainSelector"
+      },
+      {
+        "tag": "dns_direct",
+        "address": "local",
+        "strategy": "prefer_ipv4",
+        "detour": "direct"
+      },
+      {
+        "tag": "dns_block",
+        "address": "rcode://success"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns_direct"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun",
+      "interface_name": "tun0",
+      "address": ["172.16.250.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": false,
+      "auto_redirect_input_mark": "0x2",
+      "auto_redirect_output_mark": "0x2",
+      "iproute2_table_index": 252,
+      "stack": "system",
+      "endpoint_independent_nat": false,
+      "strict_route": false,
+      "sniff": false
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1080,
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "mainSelector",
+      "outbounds": [
+        "test",
+        "direct",
+        "mainUrlTest"
+      ]
+    },
+    {
+      "type": "urltest",
+      "tag": "mainUrlTest",
+      "outbounds": [
+        "test",
+        "direct"
+      ],
+      "interval": "1m0s"
+    },
+    {
+      "type": "vless",
+      "tag": "test",
+      "server": "YOURSERVERIP",
+      "server_port": 443,
+      "uuid": "id137917224",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "insecure": false,
+        "server_name": "vk.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "edge"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "t4xj72RwiT_AEeK0uzQZy4ixzkkPBfttu_SSCmJGbwg",
+          "short_id": "f0be"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "mainSelector"
+      }
+    ],
+    "auto_detect_interface": true,
+    "final": "mainSelector"
+  }
+}
