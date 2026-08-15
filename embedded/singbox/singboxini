@@ -11,7 +11,11 @@ EXTRA_COMMANDS="launch"
 SCRIPT=/etc/init.d/sing-box
 TMPDIR=/tmp/sing-box
 DATADIR=/data/sing-box
-PROG=${DATADIR}/sing-box
+# Бинарник (~17 МБ) не помещается на флеше /data на некоторых роутерах,
+# поэтому живёт в /tmp (tmpfs = RAM): не персистентен и после перезагрузки
+# роутера пропадает — check_binary() ниже про это и предупреждает.
+# config.json маленький и остаётся на /data, чтобы пережить перезагрузку.
+PROG=${TMPDIR}/sing-box
 CONF=${DATADIR}/config.json
 
 wait_for_network() {
@@ -24,10 +28,11 @@ wait_for_network() {
     echo "[sing-box] Network wait timed out, continuing anyway..."
 }
 
-# Slim-бинарник (только vless) кладёт приложение be3600 в /data (флеш)
-# при установке: из /data он маппится постранично и не занимает tmpfs
-# (в /tmp неупакованные 15 МБ жили бы в RAM целиком). Из сети ничего не
-# скачивается — единственный источник бинарника само приложение.
+# Slim-бинарник (только vless) кладёт приложение be3600 в /tmp при
+# установке — на /data ему часто не хватает места на флеше. После
+# перезагрузки роутера /tmp пуст, и без переустановки из приложения
+# сервис не поднимется. Из сети ничего не скачивается — единственный
+# источник бинарника само приложение.
 check_binary() {
     [ -x "$PROG" ] && return 0
     echo "[sing-box] Binary not found at $PROG. Reinstall sing-box from the be3600 app."

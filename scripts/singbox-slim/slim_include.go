@@ -37,6 +37,7 @@ import (
 	"github.com/sagernet/sing-box/protocol/tun"
 	"github.com/sagernet/sing-box/protocol/vless"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/observable"
 )
 
 func slimContext(ctx context.Context) context.Context {
@@ -79,11 +80,12 @@ func newClashServerStub(ctx context.Context, logFactory log.ObservableFactory, o
 	return &clashServerStub{historyStorage: urltest.NewHistoryStorage()}, nil
 }
 
-func (s *clashServerStub) Name() string                         { return "clash server (stub)" }
-func (s *clashServerStub) Start(stage adapter.StartStage) error { return nil }
-func (s *clashServerStub) Close() error                         { return nil }
-func (s *clashServerStub) Mode() string                         { return "Rule" }
-func (s *clashServerStub) ModeList() []string                   { return []string{"Rule"} }
+func (s *clashServerStub) Name() string                                            { return "clash server (stub)" }
+func (s *clashServerStub) Start(stage adapter.StartStage) error                    { return nil }
+func (s *clashServerStub) Close() error                                            { return nil }
+func (s *clashServerStub) Mode() string                                            { return "Rule" }
+func (s *clashServerStub) ModeList() []string                                      { return []string{"Rule"} }
+func (s *clashServerStub) SetModeUpdateHook(hook *observable.Subscriber[struct{}]) {}
 func (s *clashServerStub) HistoryStorage() adapter.URLTestHistoryStorage {
 	return s.historyStorage
 }

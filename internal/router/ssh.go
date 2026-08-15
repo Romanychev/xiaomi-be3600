@@ -125,25 +125,43 @@ func (sm *SSHManager) InstallSingBox(ip, password string) bool {
 	}
 	defer client.Close()
 
-	if _, err = runSSHCommand(client, "mkdir -p /data/sing-box"); err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Error creating /data/sing-box: %s", err.Error()))
+	if _, err = runSSHCommand(client, "mkdir -p /data/sing-box /tmp/sing-box"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Error creating sing-box directories: %s", err.Error()))
 		return false
 	}
-	// Бинарник живёт в /data (флеш), а не в /tmp (tmpfs = RAM): оттуда он
-	// маппится постранично и не съедает ~15 МБ памяти. Заливаем в .new и
-	// подменяем через mv — так перезапись безопасна и при работающем сервисе.
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box binary", embedded.SingBoxBinary, "/data/sing-box/sing-box.new") {
+	// Бинарник (~17 МБ) живёт в /tmp (tmpfs = RAM), не в /data (флеш): на
+	// части роутеров /data слишком мал, чтобы вместить его. Плата за это —
+	// бинарник не переживает перезагрузку роутера, тогда init-скрипт
+	// (check_binary) откажется стартовать и попросит переустановить sing-box
+	// из приложения. Заодно чистим /data/sing-box/sing-box (старое
+	// расположение бинарника — освобождает флеш при переходе на этот способ
+	// установки) и /data/etc/sing-box (путь ещё более старых версий
+	// приложения, см. UninstallSingBox). Старый /tmp-файл удаляем перед
+	// заливкой: уже запущенный процесс держит его инод открытым и продолжает
+	// работать со старым кодом до перезапуска сервиса.
+	if _, err = runSSHCommand(client, "rm -f /data/sing-box/sing-box /data/sing-box/sing-box.new /tmp/sing-box/sing-box /tmp/sing-box/sing-box.new; rm -rf /data/etc/sing-box"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Error removing old sing-box binary: %s", err.Error()))
 		return false
 	}
-	if _, err = runSSHCommand(client, "mv /data/sing-box/sing-box.new /data/sing-box/sing-box"); err != nil {
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box binary", embedded.SingBoxBinary, "/tmp/sing-box/sing-box.new") {
+		return false
+	}
+	if _, err = runSSHCommand(client, "mv /tmp/sing-box/sing-box.new /tmp/sing-box/sing-box"); err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error installing sing-box binary: %s", err.Error()))
 		return false
 	}
 	if !sm.copyEmbeddedFileWithProgress(client, "Copying init.d file", embedded.SingBoxIni, "/etc/init.d/sing-box") {
 		return false
 	}
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box config", embedded.SingBoxConfig, "/data/sing-box/config.json") {
-		return false
+	// Дефолтный конфиг ставим только при первой установке: если на роутере
+	// уже есть config.json (переустановка/обновление версии), пользовательский
+	// конфиг не трогаем — иначе Install Sing-box молча стирал бы outbounds.
+	if _, err = runSSHCommand(client, "test -f /data/sing-box/config.json"); err != nil {
+		if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box config", embedded.SingBoxConfig, "/data/sing-box/config.json") {
+			return false
+		}
+	} else {
+		sm.logWriter.LogWrite("Existing sing-box config.json found, keeping it.")
 	}
 
 	return true
@@ -230,6 +248,13 @@ func (sm *SSHManager) InstallDnsBox(ip, password string) bool {
 
 	if _, err = runSSHCommand(client, "mkdir -p /data/dns-box"); err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error creating /data/dns-box: %s", err.Error()))
+		return false
+	}
+	// /data/etc/dns-box — путь старых версий приложения (см. UninstallDnsBox);
+	// если его не сносили при переезде на текущую версию, он годами занимает
+	// флеш дубликатом бинарника.
+	if _, err = runSSHCommand(client, "rm -rf /data/etc/dns-box"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Error removing legacy dns-box install: %s", err.Error()))
 		return false
 	}
 	// Сервис работает прямо из /data/dns-box/dns-box, поэтому заливаем в
@@ -852,6 +877,14 @@ func copyBinaryToRemote(client *ssh.Client, reader io.Reader, size int64, remote
 	}
 	defer session.Close()
 
+	// scp -t reports errors (no space left, read-only fs, permission denied)
+	// as text over the same channel it uses for protocol ACKs, which we don't
+	// otherwise read; capturing it here is the only way to see why a transfer
+	// failed instead of a bare "exit status 1".
+	var remoteOutput bytes.Buffer
+	session.Stdout = &remoteOutput
+	session.Stderr = &remoteOutput
+
 	stdin, err := session.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdin pipe: %w", err)
@@ -892,6 +925,9 @@ func copyBinaryToRemote(client *ssh.Client, reader io.Reader, size int64, remote
 	stdin.Close()
 
 	if err := session.Wait(); err != nil {
+		if msg := strings.TrimSpace(remoteOutput.String()); msg != "" {
+			return fmt.Errorf("remote scp command failed: %w (remote said: %s)", err, msg)
+		}
 		return fmt.Errorf("remote scp command failed: %w", err)
 	}
 
