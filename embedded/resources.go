@@ -11,6 +11,9 @@ var SshPatch []byte
 //go:embed singbox/sing-box
 var SingBoxBinary []byte
 
+//go:embed singbox/sing-box.sha256
+var SingBoxSHA256 []byte
+
 //go:embed singbox/singboxini
 var SingBoxIni []byte
 

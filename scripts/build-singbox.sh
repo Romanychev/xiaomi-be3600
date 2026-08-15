@@ -61,4 +61,11 @@ GOOS=linux GOARCH=arm CGO_ENABLED=0 \
 
 cp ./sing-box "$DEST"
 chmod +x "$DEST"
+
+# Чек-сумма ставится на роутер вместе с бинарником (embedded/singbox_patch.sh
+# копирует её в /data/sing-box/sing-box.sha256) и используется init-скриптом,
+# чтобы проверить бинарник, скачанный с GitHub после перезагрузки роутера —
+# без него автозагрузка отказывается запускать скачанный файл.
+shasum -a 256 "$DEST" | awk '{print $1}' > "$DEST.sha256"
+
 echo "==> Done: $DEST ($(du -h "$DEST" | cut -f1), $REF)"

@@ -153,6 +153,13 @@ func (sm *SSHManager) InstallSingBox(ip, password string) bool {
 	if !sm.copyEmbeddedFileWithProgress(client, "Copying init.d file", embedded.SingBoxIni, "/etc/init.d/sing-box") {
 		return false
 	}
+	// Чек-сумма — на /data (переживает перезагрузку), а не рядом с бинарником
+	// на /tmp: без неё init-скрипт не сможет проверить файл, который сам же
+	// скачает с GitHub после ребута. Пишем её при каждой установке (в отличие
+	// от config.json), чтобы она всегда соответствовала установленной версии.
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box checksum", embedded.SingBoxSHA256, "/data/sing-box/sing-box.sha256") {
+		return false
+	}
 	// Дефолтный конфиг ставим только при первой установке: если на роутере
 	// уже есть config.json (переустановка/обновление версии), пользовательский
 	// конфиг не трогаем — иначе Install Sing-box молча стирал бы outbounds.
@@ -177,7 +184,7 @@ func (sm *SSHManager) UninstallSingBox(ip, password string) bool {
 
 	// config.json в /data/sing-box намеренно не трогаем — переустановка
 	// не должна терять пользовательский конфиг.
-	removeFilesCmd := "rm -rf /tmp/sing-box /data/etc/sing-box /data/sing-box/sing-box /data/sing-box/sing-box.new /etc/init.d/sing-box /etc/crontabs/patches/singbox_patch.sh"
+	removeFilesCmd := "rm -rf /tmp/sing-box /data/etc/sing-box /data/sing-box/sing-box /data/sing-box/sing-box.new /data/sing-box/sing-box.sha256 /etc/init.d/sing-box /etc/crontabs/patches/singbox_patch.sh"
 	_, err = runSSHCommand(client, removeFilesCmd)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error removing sing-box files: %s", err.Error()))

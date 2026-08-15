@@ -22,6 +22,8 @@ DATADIR=/data/sing-box
 # config.json маленький и остаётся на /data, чтобы пережить перезагрузку.
 PROG=${TMPDIR}/sing-box
 CONF=${DATADIR}/config.json
+CHECKSUM=${DATADIR}/sing-box.sha256
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/Romanychev/xiaomi-be3600/main/embedded/singbox"
 
 wait_for_network() {
     n=0
@@ -33,13 +35,53 @@ wait_for_network() {
     echo "[sing-box] Network wait timed out, continuing anyway..."
 }
 
-# Slim-бинарник (только vless) кладёт приложение be3600 в /tmp при
-# установке — на /data ему часто не хватает места на флеше. После
-# перезагрузки роутера /tmp пуст, и без переустановки из приложения
-# сервис не поднимется. Из сети ничего не скачивается — единственный
-# источник бинарника само приложение.
+# Slim-бинарник (только vless) кладёт приложение be3600 в /tmp при установке
+# — на /data ему часто не хватает места на флеше. После перезагрузки роутера
+# /tmp пуст, поэтому здесь же пытаемся сами скачать бинарник с GitHub —
+# именно оттуда его и кладёт приложение (repo:
+# github.com/Romanychev/xiaomi-be3600, файл embedded/singbox/sing-box).
+# Скачанный файл обязательно сверяется с sha256, который приложение пишет
+# в /data/sing-box/sing-box.sha256 при установке: без файла или при
+# несовпадении скачанное не запускается — на роутере это код с правами root,
+# доверять непроверенному скачанному бинарнику нельзя.
+download_binary() {
+    tmp="${TMPDIR}/sing-box.download"
+    rm -f "$tmp"
+    echo "[sing-box] Binary missing, trying to download from GitHub..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -o "$tmp" "${GITHUB_RAW_BASE}/sing-box" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "$tmp" "${GITHUB_RAW_BASE}/sing-box" 2>/dev/null
+    else
+        echo "[sing-box] Neither curl nor wget available, cannot auto-download."
+        return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        echo "[sing-box] Download failed."
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ ! -f "$CHECKSUM" ]; then
+        echo "[sing-box] No $CHECKSUM on this router, refusing to run unverified download."
+        rm -f "$tmp"
+        return 1
+    fi
+    expected=$(cat "$CHECKSUM")
+    actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        echo "[sing-box] Checksum mismatch (expected $expected, got $actual), refusing to run downloaded binary."
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod +x "$tmp"
+    mv "$tmp" "$PROG"
+    echo "[sing-box] Downloaded and verified sing-box binary."
+    return 0
+}
+
 check_binary() {
     [ -x "$PROG" ] && return 0
+    download_binary && return 0
     echo "[sing-box] Binary not found at $PROG. Reinstall sing-box from the be3600 app."
     return 1
 }
@@ -84,12 +126,13 @@ stop_xiaomi_services() {
     return 0
 }
 
-# Выполняется под procd: проверяет бинарник, ждёт сеть и замещает себя sing-box'ом.
+# Выполняется под procd: ждёт сеть (нужна на случай download_binary), проверяет
+# бинарник и замещает себя sing-box'ом.
 launch() {
     mkdir -p "$TMPDIR"
     stop_xiaomi_services
-    check_binary || { sleep 10; exit 1; }
     wait_for_network
+    check_binary || { sleep 10; exit 1; }
     install_tun_routes &
     # Ограничиваем кучу Go-рантайма: без лимита он неохотно отдаёт память
     # системе, а на роутере её ~176 МБ на всё.
