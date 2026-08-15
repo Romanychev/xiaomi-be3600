@@ -1,10 +1,10 @@
 #!/bin/sh
 
-[ -e "/tmp/ssh_patch.log" ] && return 0
+[ -e "/tmp/ssh_patch.log" ] && exit 0
 
 HAVE_PATCH=$( grep '= "release"' /etc/init.d/dropbear )
 if [ -z "$HAVE_PATCH" ]; then
-        return 0
+        exit 0
 fi
 
 sed -i 's/= "release"/= "XXXXXX"/g' /etc/init.d/dropbear

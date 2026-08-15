@@ -36,6 +36,13 @@ func NewSSHManager(
 			User:            "root",
 			Auth:            []ssh.AuthMethod{ssh.Password(password)},
 			HostKeyCallback: ssh.InsecureIgnoreHostKey(), // Не для продакшена!
+			// Без Timeout ssh.Dial ждёт TCP-хендшейк бесконечно: если роутер
+			// на время недоступен (например, сразу после firewall reload,
+			// который переписывает маршрут по умолчанию и iptables), Connect
+			// зависает навсегда и держит aw.busy в runTask залоченным — все
+			// последующие действия в UI получают "Another operation is
+			// still running" без возможности восстановиться.
+			Timeout: 15 * time.Second,
 		},
 		logWriter:             logWriter,
 		logWriterWithProgress: logWriterWithProgress,
@@ -63,26 +70,50 @@ func (sm *SSHManager) EnableSSHPermanent(ip, password string) bool {
 	}
 	defer client.Close()
 
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box patch", embedded.SshPatch, "/etc/crontabs/patches/ssh_patch.sh") {
+	sm.cleanupLegacyCronPatches(client)
+
+	// Сам патч-скрипт кладём на /data/sing-box/patches, а не в
+	// /etc/crontabs/patches: на части роутеров вся /etc/crontabs — read-only
+	// (часть squashfs-образа, не оверлея), и запись туда падает с
+	// "Read-only file system". /data/sing-box уже точно доступен на запись
+	// (см. InstallSingBox).
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box patch", embedded.SshPatch, "/data/sing-box/patches/ssh_patch.sh") {
 		return false
 	}
 	sm.logWriter.LogWrite("SSH patch installed to disk!")
 
-	cmdR := "crontab -l > /tmp/current_crontab && if ! grep -q 'ssh_patch.sh' /tmp/current_crontab; then echo '*/1 * * * * /etc/crontabs/patches/ssh_patch.sh >/dev/null 2>&1' >> /tmp/current_crontab; crontab /tmp/current_crontab; fi"
-	_, err = runSSHCommand(client, cmdR)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to add SSH check to cron: %v", err))
+	// Без сброса маркера повторный запуск ssh_patch.sh — no-op (см. его guard
+	// "[ -e /tmp/ssh_patch.log ] && exit 0"), и патч не перегенерируется даже
+	// если copyEmbeddedFileWithProgress выше положил на диск новую версию.
+	if _, err = runSSHCommand(client, "rm -f /tmp/ssh_patch.log"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to reset SSH patch marker: %v.", err))
 		return false
 	}
-	sm.logWriter.LogWrite("SSH installed!")
 
-	err = sm.restartCron(client)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
+	// Применяем патч сразу, не дожидаясь крона: на роутерах, где вся
+	// /etc/crontabs read-only, крон-задача ниже никогда не встанет и не
+	// выполнится, так что это единственный гарантированный способ применить
+	// патч. chmod, т.к. copyEmbeddedFileWithProgress не проставляет +x сам
+	// (внутри copyBinaryToRemote режим 0755 задаётся, но патч всё равно
+	// перестраховываемся явным chmod перед запуском).
+	if _, err = runSSHCommand(client, "chmod +x /data/sing-box/patches/ssh_patch.sh && sh /data/sing-box/patches/ssh_patch.sh"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to apply SSH patch: %v", err))
 		return false
 	}
+	sm.logWriter.LogWrite("SSH patch applied!")
+
+	// Регистрация в crontab — best-effort и не валит всю операцию: без неё
+	// патч просто не переприменится сам после сброса /etc прошивкой, но он
+	// уже применён прямо сейчас (шаг выше). На роутерах с read-only
+	// /etc/crontabs это ожидаемо не сработает.
+	cmdR := "mkdir -p /etc/crontabs && touch /etc/crontabs/root && (grep -q 'ssh_patch.sh' /etc/crontabs/root || echo '*/1 * * * * /data/sing-box/patches/ssh_patch.sh >/dev/null 2>&1' >> /etc/crontabs/root)"
+	if _, err = runSSHCommand(client, cmdR); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Cron auto-heal not available on this router (patch already applied though): %v", err))
+	} else if err = sm.restartCron(client); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
+	}
+
 	sm.logWriter.LogWrite("SSH login and script copied successfully.")
-	defer client.Close()
 	return true
 }
 
@@ -94,23 +125,41 @@ func (sm *SSHManager) EnableSingboxPermanent(ip, password string) bool {
 	}
 	defer client.Close()
 
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box patch", embedded.SingBoxPatch, "/etc/crontabs/patches/singbox_patch.sh") {
+	sm.cleanupLegacyCronPatches(client)
+
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying sing-box patch", embedded.SingBoxPatch, "/data/sing-box/patches/singbox_patch.sh") {
 		return false
 	}
 	sm.logWriter.LogWrite(fmt.Sprintf("Sing-box patch installed to disk!"))
 
-	cmdR := "crontab -l > /tmp/current_crontab && if ! grep -q 'singbox_patch.sh' /tmp/current_crontab; then echo '*/1 * * * * /etc/crontabs/patches/singbox_patch.sh >/dev/null 2>&1' >> /tmp/current_crontab; crontab /tmp/current_crontab; fi"
-	_, err = runSSHCommand(client, cmdR)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to add singbox check to cron: %v.", err))
+	// Без сброса маркера повторный запуск singbox_patch.sh — no-op (см. его
+	// guard "[ -e /tmp/singbox_patch.log ] && exit 0"), и /etc/init.d/sing-box
+	// не перегенерируется даже после обновления патча на диске — на роутере
+	// остаётся старая версия init-скрипта (например, ищущая бинарник в
+	// /data вместо /tmp), а сервис не запускается.
+	if _, err = runSSHCommand(client, "rm -f /tmp/singbox_patch.log"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to reset sing-box patch marker: %v.", err))
 		return false
 	}
-	sm.logWriter.LogWrite(fmt.Sprintf("Sing-box cron task installed!"))
 
-	err = sm.restartCron(client)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
+	// Применяем сразу — на роутерах с read-only /etc/crontabs крон-задача
+	// ниже никогда не выполнится, так что это единственный гарантированный
+	// способ реально включить /etc/init.d/sing-box (enable+start).
+	if _, err = runSSHCommand(client, "chmod +x /data/sing-box/patches/singbox_patch.sh && sh /data/sing-box/patches/singbox_patch.sh"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to apply sing-box patch: %v", err))
 		return false
+	}
+	sm.logWriter.LogWrite("Sing-box patch applied!")
+
+	// Регистрация в crontab — best-effort и не валит всю операцию: без неё
+	// патч не переприменится сам после сброса /etc прошивкой, но он уже
+	// применён прямо сейчас (шаг выше). На роутерах с read-only
+	// /etc/crontabs это ожидаемо не сработает.
+	cmdR := "mkdir -p /etc/crontabs && touch /etc/crontabs/root && (grep -q 'singbox_patch.sh' /etc/crontabs/root || echo '*/1 * * * * /data/sing-box/patches/singbox_patch.sh >/dev/null 2>&1' >> /etc/crontabs/root)"
+	if _, err = runSSHCommand(client, cmdR); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Cron auto-heal not available on this router (patch already applied though): %v", err))
+	} else if err = sm.restartCron(client); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
 	}
 
 	sm.logWriter.LogWrite(fmt.Sprintf("Sing-box patch installed successfully."))
@@ -184,14 +233,14 @@ func (sm *SSHManager) UninstallSingBox(ip, password string) bool {
 
 	// config.json в /data/sing-box намеренно не трогаем — переустановка
 	// не должна терять пользовательский конфиг.
-	removeFilesCmd := "rm -rf /tmp/sing-box /data/etc/sing-box /data/sing-box/sing-box /data/sing-box/sing-box.new /data/sing-box/sing-box.sha256 /etc/init.d/sing-box /etc/crontabs/patches/singbox_patch.sh"
+	removeFilesCmd := "rm -rf /tmp/sing-box /data/etc/sing-box /data/sing-box/sing-box /data/sing-box/sing-box.new /data/sing-box/sing-box.sha256 /etc/init.d/sing-box /data/sing-box/patches/singbox_patch.sh"
 	_, err = runSSHCommand(client, removeFilesCmd)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error removing sing-box files: %s", err.Error()))
 		return false
 	}
 
-	cmdRemove := "crontab -l > /tmp/current_crontab && sed -i '/singbox_patch.sh/d' /tmp/current_crontab && crontab /tmp/current_crontab && rm /tmp/current_crontab"
+	cmdRemove := "sed -i '/singbox_patch.sh/d' /etc/crontabs/root 2>/dev/null; true"
 	_, err = runSSHCommand(client, cmdRemove)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error uninstall cron task for sing-box %s.", err.Error()))
@@ -296,14 +345,14 @@ func (sm *SSHManager) UninstallDnsBox(ip, password string) bool {
 	}
 	defer client.Close()
 
-	removeFilesCmd := "rm -rf /tmp/dns-box /data/dns-box /data/etc/dns-box /etc/init.d/dns-box /etc/crontabs/patches/dnsbox_patch.sh"
+	removeFilesCmd := "rm -rf /tmp/dns-box /data/dns-box /data/etc/dns-box /etc/init.d/dns-box /data/sing-box/patches/dnsbox_patch.sh"
 	_, err = runSSHCommand(client, removeFilesCmd)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error removing dns-box files: %s", err.Error()))
 		return false
 	}
 
-	cmdRemove := "crontab -l > /tmp/current_crontab && sed -i '/dnsbox_patch.sh/d' /tmp/current_crontab && crontab /tmp/current_crontab && rm /tmp/current_crontab"
+	cmdRemove := "sed -i '/dnsbox_patch.sh/d' /etc/crontabs/root 2>/dev/null; true"
 	_, err = runSSHCommand(client, cmdRemove)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error uninstall cron task for dns-box %s.", err.Error()))
@@ -332,26 +381,42 @@ func (sm *SSHManager) EnableDnsBoxPermanent(ip, password string) bool {
 	}
 	defer client.Close()
 
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying dns-box patch", embedded.DnsBoxPatch, "/etc/crontabs/patches/dnsbox_patch.sh") {
+	sm.cleanupLegacyCronPatches(client)
+
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying dns-box patch", embedded.DnsBoxPatch, "/data/sing-box/patches/dnsbox_patch.sh") {
 		return false
 	}
 	sm.logWriter.LogWrite(fmt.Sprintf("Dns-box patch installed to disk!"))
 
-	cmdR := "crontab -l > /tmp/current_crontab && if ! grep -q 'dnsbox_patch.sh' /tmp/current_crontab; then echo '*/1 * * * * /etc/crontabs/patches/dnsbox_patch.sh >/dev/null 2>&1' >> /tmp/current_crontab; crontab /tmp/current_crontab; fi"
-	_, err = runSSHCommand(client, cmdR)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to add dnsbox check to cron: %v.", err))
+	// Без сброса маркера повторный запуск dnsbox_patch.sh — no-op (см. его
+	// guard "[ -e /tmp/dnsbox_patch.log ] && exit 0"), и /etc/init.d/dns-box
+	// не перегенерируется даже после обновления патча на диске.
+	if _, err = runSSHCommand(client, "rm -f /tmp/dnsbox_patch.log"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to reset dns-box patch marker: %v.", err))
 		return false
 	}
-	sm.logWriter.LogWrite(fmt.Sprintf("dns-box cron task installed!"))
 
-	err = sm.restartCron(client)
-	if err != nil {
+	// Применяем сразу — на роутерах с read-only /etc/crontabs крон-задача
+	// ниже никогда не выполнится, так что это единственный гарантированный
+	// способ реально включить /etc/init.d/dns-box (enable+start).
+	if _, err = runSSHCommand(client, "chmod +x /data/sing-box/patches/dnsbox_patch.sh && sh /data/sing-box/patches/dnsbox_patch.sh"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to apply dns-box patch: %v", err))
+		return false
+	}
+	sm.logWriter.LogWrite("Dns-box patch applied!")
+
+	// Регистрация в crontab — best-effort и не валит всю операцию: без неё
+	// патч не переприменится сам после сброса /etc прошивкой, но он уже
+	// применён прямо сейчас (шаг выше). На роутерах с read-only
+	// /etc/crontabs это ожидаемо не сработает.
+	cmdR := "mkdir -p /etc/crontabs && touch /etc/crontabs/root && (grep -q 'dnsbox_patch.sh' /etc/crontabs/root || echo '*/1 * * * * /data/sing-box/patches/dnsbox_patch.sh >/dev/null 2>&1' >> /etc/crontabs/root)"
+	if _, err = runSSHCommand(client, cmdR); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Cron auto-heal not available on this router (patch already applied though): %v", err))
+	} else if err = sm.restartCron(client); err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
-		return false
 	}
 
-	sm.logWriter.LogWrite(fmt.Sprintf("Sing-box patch installed successfully."))
+	sm.logWriter.LogWrite(fmt.Sprintf("Dns-box patch installed successfully."))
 	return true
 }
 
@@ -363,7 +428,9 @@ func (sm *SSHManager) FirewallPatchInstall(ip, password string) bool {
 	}
 	defer client.Close()
 
-	if !sm.copyEmbeddedFileWithProgress(client, "Copying firewall patch", embedded.FirewallPatch, "/etc/crontabs/patches/firewall_patch.sh") {
+	sm.cleanupLegacyCronPatches(client)
+
+	if !sm.copyEmbeddedFileWithProgress(client, "Copying firewall patch", embedded.FirewallPatch, "/data/sing-box/patches/firewall_patch.sh") {
 		return false
 	}
 
@@ -374,18 +441,35 @@ func (sm *SSHManager) FirewallPatchInstall(ip, password string) bool {
 		return false
 	}
 
-	cmdR := "crontab -l > /tmp/current_crontab && if ! grep -q 'firewall_patch.sh' /tmp/current_crontab; then echo '*/1 * * * * /etc/crontabs/patches/firewall_patch.sh >/dev/null 2>&1' >> /tmp/current_crontab; crontab /tmp/current_crontab; fi"
-	_, err = runSSHCommand(client, cmdR)
-	if err != nil {
-		sm.logWriter.LogWrite(fmt.Sprintf("Failed to add firewall check to cron: %v.", err))
+	// Применяем сразу — на роутерах с read-only /etc/crontabs крон-задача
+	// ниже никогда не выполнится. Без неё, впрочем, правила iptables/ipset
+	// не будут переприменяться периодически (например, после перезапуска
+	// sing-box/tun0) — на таких роутерах это придётся делать вручную через
+	// FirewallReload.
+	//
+	// Запускаем в фоне (&): install_routes/reload внутри скрипта ждут tun0 и
+	// ipset vpn_domains до 30×2с каждый — если Firewall Patch Install
+	// нажали сразу после установки sing-box/dns-box, до того как их
+	// сервисы поднялись, эта команда держала бы SSH-сессию до ~2 минут,
+	// что выглядело как зависание всего приложения (busy-флаг снимается
+	// только когда runSSHCommand возвращается). Само применение при этом
+	// idempotent и безопасно продолжить в фоне после отключения SSH.
+	if _, err = runSSHCommand(client, "chmod +x /data/sing-box/patches/firewall_patch.sh && nohup sh /data/sing-box/patches/firewall_patch.sh >/tmp/firewall_patch_apply.log 2>&1 &"); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Failed to launch firewall patch: %v", err))
 		return false
 	}
-	sm.logWriter.LogWrite(fmt.Sprintf("Firewall cron task installed!"))
+	sm.logWriter.LogWrite("Firewall patch launched (applying in background, may take up to a couple minutes if sing-box/dns-box are still starting)...")
 
-	err = sm.restartCron(client)
+	// Регистрация в crontab — best-effort и не валит всю операцию: без неё
+	// патч не переприменится сам периодически, но он уже применён прямо
+	// сейчас (шаг выше). На роутерах с read-only /etc/crontabs это ожидаемо
+	// не сработает.
+	cmdR := "mkdir -p /etc/crontabs && touch /etc/crontabs/root && (grep -q 'firewall_patch.sh' /etc/crontabs/root || echo '*/1 * * * * /data/sing-box/patches/firewall_patch.sh >/dev/null 2>&1' >> /etc/crontabs/root)"
+	_, err = runSSHCommand(client, cmdR)
 	if err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Cron auto-heal not available on this router (patch already applied though): %v.", err))
+	} else if err = sm.restartCron(client); err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Failed to restart cron: %v", err))
-		return false
 	}
 	sm.logWriter.LogWrite("Firewall patch installed successfully!")
 	return true
@@ -399,14 +483,14 @@ func (sm *SSHManager) FirewallPatchUninstall(ip, password string) bool {
 	}
 	defer client.Close()
 
-	removeFilesCmd := "rm -rf /data/userdisk/appdata/firewall.sh /etc/crontabs/patches/firewall_patch.sh"
+	removeFilesCmd := "rm -rf /data/userdisk/appdata/firewall.sh /data/sing-box/patches/firewall_patch.sh"
 	_, err = runSSHCommand(client, removeFilesCmd)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error removing dns-box files: %s", err.Error()))
 		return false
 	}
 
-	cmdRemove := "crontab -l > /tmp/current_crontab && sed -i '/firewall_patch.sh/d' /tmp/current_crontab && crontab /tmp/current_crontab && rm /tmp/current_crontab"
+	cmdRemove := "sed -i '/firewall_patch.sh/d' /etc/crontabs/root 2>/dev/null; true"
 	_, err = runSSHCommand(client, cmdRemove)
 	if err != nil {
 		sm.logWriter.LogWrite(fmt.Sprintf("Error uninstall task for firewall:  %s.", err.Error()))
@@ -679,6 +763,34 @@ func (sm *SSHManager) copyEmbeddedFileWithProgress(client *ssh.Client, descripti
 	}
 	sm.logWriterWithProgress.LogWriteWithProgress(description, task)
 	return copyErr == nil
+}
+
+// cleanupLegacyCronPatches removes the pre-migration copies of the patch
+// scripts from /etc/crontabs/patches and their crontab entries. Older app
+// versions installed patches there; newer ones use /data/sing-box/patches
+// (some routers have /etc/crontabs read-only). Routers updated from an old
+// install keep both: the stale /etc/crontabs/patches copy still fires every
+// minute via cron and its "[ -e /tmp/x_patch.log ] && return 0" guard doesn't
+// actually stop it (`return` outside a function is a no-op error in ash when
+// the script is run rather than sourced — busybox prints to stderr and keeps
+// going) — so it keeps re-overwriting /etc/init.d/* with the old design
+// (binary path, no /tmp+download fallback, etc.) every minute, fighting the
+// current patch and spawning duplicate service instances. Best-effort: a
+// router where /etc/crontabs is read-only fails these silently, which is
+// fine — there's nothing to clean there anyway.
+func (sm *SSHManager) cleanupLegacyCronPatches(client *ssh.Client) {
+	cmd := "sed -i " +
+		"-e '\\|/etc/crontabs/patches/ssh_patch.sh|d' " +
+		"-e '\\|/etc/crontabs/patches/singbox_patch.sh|d' " +
+		"-e '\\|/etc/crontabs/patches/dnsbox_patch.sh|d' " +
+		"-e '\\|/etc/crontabs/patches/firewall_patch.sh|d' " +
+		"/etc/crontabs/root 2>/dev/null; " +
+		"rm -f /etc/crontabs/patches/ssh_patch.sh /etc/crontabs/patches/singbox_patch.sh " +
+		"/etc/crontabs/patches/dnsbox_patch.sh /etc/crontabs/patches/firewall_patch.sh; " +
+		"true"
+	if _, err := runSSHCommand(client, cmd); err != nil {
+		sm.logWriter.LogWrite(fmt.Sprintf("Legacy cron patch cleanup skipped: %v", err))
+	}
 }
 
 func (sm *SSHManager) restartCron(client *ssh.Client) error {

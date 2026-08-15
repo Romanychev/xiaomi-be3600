@@ -32,6 +32,16 @@ load_user_ips() {
 }
 
 install_routes() {
+    # tun0 появляется асинхронно (sing-box стартует под procd и поднимает
+    # интерфейс уже после того, как launch() дождётся сети), поэтому патч,
+    # применённый сразу после установки/запуска sing-box, может застать
+    # интерфейс ещё не поднятым — ждём как install_tun_routes в самом
+    # sing-box init-скрипте, а не падаем с первой попытки.
+    n=0
+    while [ "$n" -lt 30 ] && ! ip link show tun0 >/dev/null 2>&1; do
+        n=$((n + 1))
+        sleep 2
+    done
     # Без маршрута в таблице fwmark-правило никуда не ведёт и трафик уходит в WAN
     if ip link show tun0 >/dev/null 2>&1; then
         ip route replace default dev tun0 table $TABLE
@@ -40,8 +50,13 @@ install_routes() {
         echo "Error: tun0 is not up (sing-box not running?), route not installed" >&2
         return 1
     fi
-    ip rule list | grep -q "fwmark $MARK lookup $TABLE" || ip rule add fwmark $MARK lookup $TABLE
-    ip -6 rule list 2>/dev/null | grep -q "fwmark $MARK lookup $TABLE" || ip -6 rule add fwmark $MARK lookup $TABLE 2>/dev/null
+    # Матчим только по "fwmark $MARK ", без "lookup $TABLE": `ip rule list`
+    # печатает таблицу по имени из /etc/iproute2/rt_tables (например "vpn"),
+    # если оно там определено для этого номера, а не по номеру — сравнение с
+    # "lookup $TABLE" тогда никогда не совпадает, и правило добавляется
+    # заново при каждом reload, бесконечно накапливая дубликаты.
+    ip rule list | grep -q "fwmark $MARK " || ip rule add fwmark $MARK lookup $TABLE
+    ip -6 rule list 2>/dev/null | grep -q "fwmark $MARK " || ip -6 rule add fwmark $MARK lookup $TABLE 2>/dev/null
     return 0
 }
 
@@ -61,6 +76,13 @@ reload() {
         ip6tables -C FORWARD -m mark --mark $MARK -j ACCEPT 2>/dev/null || ip6tables -I FORWARD -m mark --mark $MARK -j ACCEPT
     fi
 
+    # dns-box создаёт ipset при своём старте, который тоже асинхронный
+    # (procd + собственный wait_for_network) — та же гонка, что и с tun0 выше.
+    n=0
+    while [ "$n" -lt 30 ] && ! ipset list vpn_domains >/dev/null 2>&1; do
+        n=$((n + 1))
+        sleep 2
+    done
     if ! ipset list vpn_domains >/dev/null 2>&1; then
         echo "Error: ipset vpn_domains does not exist (dns-box not running?)" >&2
         return 1

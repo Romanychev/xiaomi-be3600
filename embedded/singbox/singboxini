@@ -89,8 +89,13 @@ install_tun_routes() {
         if ip link show tun0 >/dev/null 2>&1; then
             ip route replace default dev tun0 table 252
             ip -6 route replace default dev tun0 table 252 2>/dev/null
-            ip rule list | grep -q "fwmark 0x2 lookup 252" || ip rule add fwmark 0x2 lookup 252
-            ip -6 rule list 2>/dev/null | grep -q "fwmark 0x2 lookup 252" || ip -6 rule add fwmark 0x2 lookup 252 2>/dev/null
+            # Матчим только по "fwmark 0x2 ", без "lookup 252": `ip rule
+            # list` печатает таблицу по имени из /etc/iproute2/rt_tables
+            # (например "vpn"), если оно там определено, а не по номеру —
+            # сравнение с "lookup 252" тогда никогда не совпадает, и правило
+            # добавляется заново при каждом respawn, накапливая дубликаты.
+            ip rule list | grep -q "fwmark 0x2 " || ip rule add fwmark 0x2 lookup 252
+            ip -6 rule list 2>/dev/null | grep -q "fwmark 0x2 " || ip -6 rule add fwmark 0x2 lookup 252 2>/dev/null
             return 0
         fi
         n=$((n + 1))
@@ -132,6 +137,12 @@ launch() {
     # Ограничиваем кучу Go-рантайма: без лимита он неохотно отдаёт память
     # системе, а на роутере её ~176 МБ на всё.
     export GOMEMLIMIT=64MiB GOGC=50
+    # config.json описывает dns.servers в legacy-формате (address:
+    # "1.1.1.1"/"local"/"rcode://success"). Начиная с sing-box 1.12 это
+    # печатает FATAL и отказывается стартовать без явного флага; полностью
+    # уберут в 1.14.0 — тогда придётся мигрировать на новую схему серверов
+    # (см. https://sing-box.sagernet.org/migration/#migrate-to-new-dns-server-formats).
+    export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true
     exec "$PROG" run -c "$CONF" -D "$TMPDIR"
 }
 

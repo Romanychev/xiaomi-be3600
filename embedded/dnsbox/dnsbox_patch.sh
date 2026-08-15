@@ -1,6 +1,6 @@
 #!/bin/sh
 
-[ -e "/tmp/dnsbox_patch.log" ] && return 0
+[ -e "/tmp/dnsbox_patch.log" ] && exit 0
 
 cat << 'EOF' > /etc/init.d/dns-box
 #!/bin/sh /etc/rc.common

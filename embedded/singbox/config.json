@@ -5,6 +5,12 @@
   "dns": {
     "servers": [
       {
+        "tag": "dns_direct",
+        "address": "local",
+        "strategy": "prefer_ipv4",
+        "detour": "direct"
+      },
+      {
         "tag": "dns_proxy",
         "address": "1.1.1.1",
         "address_resolver": "dns_direct",
@@ -12,20 +18,8 @@
         "detour": "mainSelector"
       },
       {
-        "tag": "dns_direct",
-        "address": "local",
-        "strategy": "prefer_ipv4",
-        "detour": "direct"
-      },
-      {
         "tag": "dns_block",
         "address": "rcode://success"
-      }
-    ],
-    "rules": [
-      {
-        "outbound": "any",
-        "server": "dns_direct"
       }
     ]
   },
@@ -41,15 +35,13 @@
       "iproute2_table_index": 252,
       "stack": "system",
       "endpoint_independent_nat": false,
-      "strict_route": false,
-      "sniff": false
+      "strict_route": false
     },
     {
       "type": "mixed",
       "tag": "mixed-in",
       "listen": "0.0.0.0",
-      "listen_port": 1080,
-      "sniff": true
+      "listen_port": 1080
     }
   ],
   "outbounds": [
@@ -99,13 +91,8 @@
     }
   ],
   "route": {
-    "rules": [
-      {
-        "protocol": "dns",
-        "outbound": "mainSelector"
-      }
-    ],
     "auto_detect_interface": true,
+    "default_domain_resolver": "dns_direct",
     "final": "mainSelector"
   }
 }
